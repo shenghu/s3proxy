@@ -77,6 +77,7 @@ import com.google.common.hash.HashingInputStream;
 import com.google.common.io.BaseEncoding;
 import com.google.common.io.ByteSource;
 import com.google.common.io.ByteStreams;
+import com.google.common.io.FileBackedOutputStream;
 import com.google.common.net.HostAndPort;
 import com.google.common.net.HttpHeaders;
 import com.google.common.net.PercentEscaper;
@@ -1464,6 +1465,7 @@ final class S3ProxyHandler extends AbstractHandler {
 
         String eTag;
         try {
+            // TODO: B2
             eTag = blobStore.copyBlob(
                     sourceContainerName, sourceBlobName,
                     destContainerName, destBlobName, options.build());
@@ -1563,15 +1565,6 @@ final class S3ProxyHandler extends AbstractHandler {
             return;
         }
 
-        BlobBuilder.PayloadBlobBuilder builder = blobStore
-                .blobBuilder(blobName)
-                .payload(is)
-                .contentLength(contentLength);
-        addContentMetdataFromHttpRequest(builder, request);
-        if (contentMD5 != null) {
-            builder = builder.contentMD5(contentMD5);
-        }
-
         PutOptions options = new PutOptions().setBlobAccess(access);
 
         String blobStoreType = getBlobStoreType(blobStore);
@@ -1579,8 +1572,31 @@ final class S3ProxyHandler extends AbstractHandler {
                 contentLength > 64 * 1024 * 1024) {
             options.multipart(true);
         }
+
+        FileBackedOutputStream fbos = null;
         String eTag;
         try {
+            BlobBuilder.PayloadBlobBuilder builder;
+            if (blobStoreType.equals("b2")) {
+                // B2 requires a repeatable payload to calculate the SHA1 hash
+                // TODO: configurable fileThreshold
+                fbos = new FileBackedOutputStream(1024 * 1024);
+                ByteStreams.copy(is, fbos);
+                fbos.close();
+                builder = blobStore.blobBuilder(blobName)
+                        .payload(fbos.asByteSource());
+            } else {
+                builder = blobStore.blobBuilder(blobName)
+                        .payload(is);
+            }
+
+            builder.contentLength(contentLength);
+
+            addContentMetdataFromHttpRequest(builder, request);
+            if (contentMD5 != null) {
+                builder = builder.contentMD5(contentMD5);
+            }
+
             eTag = blobStore.putBlob(containerName, builder.build(),
                     options);
         } catch (HttpResponseException hre) {
@@ -1605,6 +1621,10 @@ final class S3ProxyHandler extends AbstractHandler {
                 throw new S3Exception(S3ErrorCode.REQUEST_TIMEOUT, re);
             } else {
                 throw re;
+            }
+        } finally {
+            if (fbos != null) {
+                fbos.reset();
             }
         }
 
@@ -2101,6 +2121,7 @@ final class S3ProxyHandler extends AbstractHandler {
                 eTag = BaseEncoding.base16().lowerCase().encode(
                         his.hash().asBytes());
             } else {
+                // TODO: b2
                 Payload payload = Payloads.newInputStreamPayload(is);
                 payload.getContentMetadata().setContentLength(contentLength);
 
@@ -2231,14 +2252,35 @@ final class S3ProxyHandler extends AbstractHandler {
                     BaseEncoding.base16().lowerCase().encode(
                             his.hash().asBytes())));
         } else {
-            Payload payload = Payloads.newInputStreamPayload(is);
-            payload.getContentMetadata().setContentLength(contentLength);
-            if (contentMD5 != null) {
-                payload.getContentMetadata().setContentMD5(contentMD5);
+            MultipartPart part;
+            Payload payload;
+            FileBackedOutputStream fbos = null;
+            try {
+                String blobStoreType = getBlobStoreType(blobStore);
+                if (blobStoreType.equals("b2")) {
+                    // B2 requires a repeatable payload to calculate the SHA1
+                    // hash
+                    // TODO: configurable fileThreshold
+                    fbos = new FileBackedOutputStream(1024 * 1024);
+                    ByteStreams.copy(is, fbos);
+                    fbos.close();
+                    payload = Payloads.newByteSourcePayload(
+                            fbos.asByteSource());
+                } else {
+                    payload = Payloads.newInputStreamPayload(is);
+                }
+                payload.getContentMetadata().setContentLength(contentLength);
+                if (contentMD5 != null) {
+                    payload.getContentMetadata().setContentMD5(contentMD5);
+                }
+
+                part = blobStore.uploadMultipartPart(mpu, partNumber, payload);
+            } finally {
+                if (fbos != null) {
+                    fbos.reset();
+                }
             }
 
-            MultipartPart part = blobStore.uploadMultipartPart(mpu,
-                    partNumber, payload);
             if (part.partETag() != null) {
                 response.addHeader(HttpHeaders.ETAG,
                         maybeQuoteETag(part.partETag()));
